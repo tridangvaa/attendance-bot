@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 from config import STAFF, ADMIN_IDS
@@ -11,12 +11,15 @@ logger = logging.getLogger(__name__)
 active_sessions: dict[int, dict] = {}
 
 
+_VN_TZ = timezone(timedelta(hours=7))
+
+
 def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(_VN_TZ).strftime("%Y-%m-%d")
 
 
 def _now_time() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(_VN_TZ).strftime("%H:%M:%S")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -178,7 +181,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if session and session["date"] == date_str:
         # Currently checked in
-        now = datetime.strptime(_now_time(), "%H:%M:%S")
+        now = datetime.strptime(_now_time(), "%H:%M:%S")  # already VN time via _now_time()
         start = datetime.strptime(session["checkin"], "%H:%M:%S")
         elapsed_min = int((now - start).total_seconds() // 60)
         hours, minutes = divmod(elapsed_min, 60)
