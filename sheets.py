@@ -9,6 +9,8 @@ from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME, 
 STAFF_SHEET_NAME = "Staff"
 STAFF_HEADERS = ["Telegram ID", "Name"]
 
+DEDUP_SHEET_NAME = "ProcessedUpdates"
+
 _client: Optional[gspread.Client] = None
 
 
@@ -43,6 +45,28 @@ def _get_staff_sheet() -> gspread.Worksheet:
         ws = spreadsheet.add_worksheet(title=STAFF_SHEET_NAME, rows=100, cols=2)
         ws.append_row(STAFF_HEADERS)
     return ws
+
+
+def _get_dedup_sheet() -> gspread.Worksheet:
+    spreadsheet = _get_client().open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return spreadsheet.worksheet(DEDUP_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=DEDUP_SHEET_NAME, rows=1000, cols=1)
+        ws.append_row(["Update ID"])
+        return ws
+
+
+def claim_update(update_id: int) -> bool:
+    """
+    Claim an update_id in the shared ProcessedUpdates sheet.
+    Returns True if this call is the first to claim it (safe to process).
+    Returns False if another instance already claimed it (skip processing).
+    """
+    ws = _get_dedup_sheet()
+    ws.append_row([str(update_id)])
+    all_ids = ws.col_values(1)[1:]  # skip header
+    return all_ids.count(str(update_id)) == 1
 
 
 def ensure_headers() -> None:

@@ -10,8 +10,6 @@ logger = logging.getLogger(__name__)
 # In-memory session cache: { telegram_id: {"name": str, "checkin": str, "row": int, "date": str} }
 active_sessions: dict[int, dict] = {}
 
-# Deduplication: track processed update_ids to ignore retries/duplicate deliveries
-_processed_updates: set[int] = set()
 
 
 def _get_staff() -> dict[int, str]:
@@ -57,9 +55,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── /checkin ──────────────────────────────────────────────────────────────────
 
 async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.update_id in _processed_updates:
+    if not sheets.claim_update(update.update_id):
         return
-    _processed_updates.add(update.update_id)
 
     user_id = update.effective_user.id
     staff = _get_staff()
@@ -129,9 +126,8 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ── /checkout ─────────────────────────────────────────────────────────────────
 
 async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.update_id in _processed_updates:
+    if not sheets.claim_update(update.update_id):
         return
-    _processed_updates.add(update.update_id)
 
     user_id = update.effective_user.id
     staff = _get_staff()
