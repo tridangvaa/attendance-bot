@@ -48,7 +48,7 @@ def main() -> None:
     app.post_init = set_commands
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

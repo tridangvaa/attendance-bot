@@ -64,9 +64,11 @@ def claim_update(update_id: int) -> bool:
     Returns False if another instance already claimed it (skip processing).
     """
     ws = _get_dedup_sheet()
+    all_ids = ws.col_values(1)[1:]  # skip header — read BEFORE appending
+    if str(update_id) in all_ids:
+        return False
     ws.append_row([str(update_id)])
-    all_ids = ws.col_values(1)[1:]  # skip header
-    return all_ids.count(str(update_id)) == 1
+    return True
 
 
 def ensure_headers() -> None:
