@@ -97,6 +97,16 @@ def checkout_to_sheet(row_index: int, checkout_time: str, duration: str) -> None
     sheet.update_cell(row_index, 6, duration)         # F = Duration
 
 
+def find_completed_checkout(user_id: int, date_str: str) -> bool:
+    """Return True if the user already has a completed checkout today."""
+    sheet = get_sheet()
+    rows = sheet.get_all_values()
+    for row in rows[1:]:
+        if len(row) >= 5 and row[2] == str(user_id) and row[0] == date_str and row[4]:
+            return True
+    return False
+
+
 def find_open_checkin(user_id: int, date_str: str) -> Optional[int]:
     """
     Fallback scan used after a bot restart.

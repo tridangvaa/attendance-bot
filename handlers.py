@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 # In-memory session cache: { telegram_id: {"name": str, "checkin": str, "row": int, "date": str} }
 active_sessions: dict[int, dict] = {}
 
+# Deduplication: track processed update_ids to ignore retries/duplicate deliveries
+_processed_updates: set[int] = set()
+
 
 def _get_staff() -> dict[int, str]:
     """Merge config.py staff with Google Sheet staff. Sheet entries take priority."""
@@ -54,6 +57,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── /checkin ──────────────────────────────────────────────────────────────────
 
 async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.update_id in _processed_updates:
+        return
+    _processed_updates.add(update.update_id)
+
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
@@ -122,6 +129,10 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ── /checkout ─────────────────────────────────────────────────────────────────
 
 async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.update_id in _processed_updates:
+        return
+    _processed_updates.add(update.update_id)
+
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
@@ -130,6 +141,13 @@ async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     name = staff[user_id]
     date_str = _today()
+
+    if sheets.find_completed_checkout(user_id, date_str):
+        await update.message.reply_text(
+            f"⚠️ *{name}*, bạn đã chấm công ra hôm nay rồi.",
+            parse_mode="Markdown",
+        )
+        return
 
     # Accept optional time argument: /checkout 17:30 or /checkout 17:30:00
     if context.args:
