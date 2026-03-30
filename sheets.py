@@ -6,13 +6,15 @@ from datetime import datetime
 from typing import Optional
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME, SHEET_HEADERS
 
+STAFF_SHEET_NAME = "Staff"
+STAFF_HEADERS = ["Telegram ID", "Name"]
+
 _client: Optional[gspread.Client] = None
 
 
-def get_sheet() -> gspread.Worksheet:
+def _get_client() -> gspread.Client:
     global _client
     if _client is None:
-        # Support credentials from env var (for cloud deploy) or file (for local)
         creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
         if creds_json:
             info = json.loads(creds_json)
@@ -26,13 +28,59 @@ def get_sheet() -> gspread.Worksheet:
                 scopes=["https://www.googleapis.com/auth/spreadsheets"],
             )
         _client = gspread.authorize(creds)
-    return _client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+    return _client
+
+
+def get_sheet() -> gspread.Worksheet:
+    return _get_client().open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+
+
+def _get_staff_sheet() -> gspread.Worksheet:
+    spreadsheet = _get_client().open_by_key(GOOGLE_SHEET_ID)
+    try:
+        ws = spreadsheet.worksheet(STAFF_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=STAFF_SHEET_NAME, rows=100, cols=2)
+        ws.append_row(STAFF_HEADERS)
+    return ws
 
 
 def ensure_headers() -> None:
     sheet = get_sheet()
     if sheet.row_values(1) != SHEET_HEADERS:
         sheet.insert_row(SHEET_HEADERS, index=1)
+    # Also ensure staff sheet exists
+    _get_staff_sheet()
+
+
+def load_staff() -> dict[int, str]:
+    """Load all staff from the Staff sheet. Returns {telegram_id: name}."""
+    ws = _get_staff_sheet()
+    records = ws.get_all_records()
+    return {int(r["Telegram ID"]): str(r["Name"]) for r in records if r.get("Telegram ID")}
+
+
+def add_staff(telegram_id: int, name: str) -> None:
+    """Add a staff member to the Staff sheet."""
+    ws = _get_staff_sheet()
+    # Update if already exists, otherwise append
+    records = ws.get_all_values()
+    for i, row in enumerate(records[1:], start=2):
+        if row and str(row[0]) == str(telegram_id):
+            ws.update_cell(i, 2, name)
+            return
+    ws.append_row([str(telegram_id), name])
+
+
+def remove_staff(telegram_id: int) -> bool:
+    """Remove a staff member by Telegram ID. Returns True if found and removed."""
+    ws = _get_staff_sheet()
+    records = ws.get_all_values()
+    for i, row in enumerate(records[1:], start=2):
+        if row and str(row[0]) == str(telegram_id):
+            ws.delete_rows(i)
+            return True
+    return False
 
 
 def checkin_to_sheet(user_id: int, name: str, date_str: str, time_str: str) -> int:
