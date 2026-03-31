@@ -1,5 +1,7 @@
 import logging
+import sys
 from telegram import BotCommand
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler
 from config import TELEGRAM_BOT_TOKEN
 from handlers import (
@@ -48,7 +50,11 @@ def main() -> None:
     app.post_init = set_commands
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Conflict:
+        logger.error("Another bot instance is already running. Exiting.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
