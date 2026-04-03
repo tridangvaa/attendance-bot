@@ -1,5 +1,9 @@
+import asyncio
 import logging
+import sys
+import time
 from telegram import BotCommand
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler
 from config import TELEGRAM_BOT_TOKEN
 from handlers import (
@@ -16,9 +20,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    # Ensure the Google Sheet has the correct header row
-    logger.info("Initialising Google Sheet headers...")
+async def _error_handler(update, context) -> None:
+    if isinstance(context.error, Conflict):
+        logger.error("409 Conflict — another instance is running. Exiting so the process manager can restart.")
+        sys.exit(1)
+    logger.error("Unhandled exception", exc_info=context.error)
+
+
+def _run_once() -> None:
     sheets.ensure_headers()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -31,8 +40,8 @@ def main() -> None:
     app.add_handler(CommandHandler("addstaff",     addstaff_handler))
     app.add_handler(CommandHandler("removestaff",  removestaff_handler))
     app.add_handler(CommandHandler("liststaff",    liststaff_handler))
+    app.add_error_handler(_error_handler)
 
-    # Set Vietnamese command descriptions shown in Telegram menu
     async def set_commands(app: Application) -> None:
         await app.bot.set_my_commands([
             BotCommand("start",       "Bắt đầu / xem hướng dẫn"),
@@ -49,6 +58,20 @@ def main() -> None:
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
+
+
+def main() -> None:
+    logger.info("Initialising Google Sheet headers...")
+    while True:
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            _run_once()
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Bot stopped.")
+            break
+        except Exception as e:
+            logger.error("Bot crashed: %s — restarting in 10s", e)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
