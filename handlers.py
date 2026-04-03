@@ -214,16 +214,12 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session = active_sessions.get(user_id)
 
     if session and session["date"] == date_str:
-        # Currently checked in
-        now = datetime.strptime(_now_time(), "%H:%M:%S")  # already VN time via _now_time()
-        start = datetime.strptime(session["checkin"], "%H:%M:%S")
-        elapsed_min = int((now - start).total_seconds() // 60)
-        hours, minutes = divmod(elapsed_min, 60)
+        # Currently checked in, not yet checked out
         await update.message.reply_text(
             f"📊 *Trạng thái — {name}*\n"
             f"📅 Ngày: {date_str}\n"
             f"✅ Giờ vào: {session['checkin']}\n"
-            f"⏳ Đã làm việc: {hours}h {minutes:02d}m",
+            f"⏳ Chưa checkout",
             parse_mode="Markdown",
         )
     else:

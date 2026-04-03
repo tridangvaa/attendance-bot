@@ -1,10 +1,13 @@
 import gspread
 import json
+import logging
 import os
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from typing import Optional
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME, SHEET_HEADERS
+
+logger = logging.getLogger(__name__)
 
 STAFF_SHEET_NAME = "Staff"
 STAFF_HEADERS = ["Telegram ID", "Name"]
@@ -14,27 +17,45 @@ DEDUP_SHEET_NAME = "ProcessedUpdates"
 _client: Optional[gspread.Client] = None
 
 
+def _make_client() -> gspread.Client:
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+    else:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+    return gspread.authorize(creds)
+
+
 def _get_client() -> gspread.Client:
     global _client
     if _client is None:
-        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-        if creds_json:
-            info = json.loads(creds_json)
-            creds = Credentials.from_service_account_info(
-                info,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
-            )
-        else:
-            creds = Credentials.from_service_account_file(
-                GOOGLE_CREDENTIALS_FILE,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
-            )
-        _client = gspread.authorize(creds)
+        _client = _make_client()
+    return _client
+
+
+def _reset_client() -> gspread.Client:
+    """Force re-authentication and return a fresh client."""
+    global _client
+    _client = _make_client()
     return _client
 
 
 def get_sheet() -> gspread.Worksheet:
-    return _get_client().open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+    try:
+        return _get_client().open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+    except gspread.exceptions.APIError as e:
+        status = getattr(e.response, "status_code", None)
+        if status in (401, 403):
+            logger.warning("get_sheet auth error (%s) — re-authing", status)
+            return _reset_client().open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+        raise
 
 
 def _get_staff_sheet() -> gspread.Worksheet:
@@ -62,13 +83,26 @@ def claim_update(update_id: int) -> bool:
     Claim an update_id in the shared ProcessedUpdates sheet.
     Returns True if this call is the first to claim it (safe to process).
     Returns False if another instance already claimed it (skip processing).
+    On Sheets API failure, logs and allows processing (fail-open).
     """
-    ws = _get_dedup_sheet()
-    all_ids = ws.col_values(1)[1:]  # skip header — read BEFORE appending
-    if str(update_id) in all_ids:
-        return False
-    ws.append_row([str(update_id)])
-    return True
+    try:
+        ws = _get_dedup_sheet()
+        all_ids = ws.col_values(1)[1:]  # skip header — read BEFORE appending
+        if str(update_id) in all_ids:
+            return False
+        ws.append_row([str(update_id)])
+        return True
+    except gspread.exceptions.APIError as e:
+        status = getattr(e.response, "status_code", None)
+        logger.warning("claim_update API error (status=%s): %s — re-authing and allowing update", status, e)
+        try:
+            _reset_client()
+        except Exception as re_err:
+            logger.error("Re-auth failed: %s", re_err)
+        return True  # fail-open: let the update through
+    except Exception as e:
+        logger.warning("claim_update unexpected error: %s — allowing update", e)
+        return True  # fail-open
 
 
 def ensure_headers() -> None:
