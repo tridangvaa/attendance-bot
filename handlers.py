@@ -1,14 +1,33 @@
 import logging
+import math
 from datetime import datetime, timezone, timedelta
-from telegram import Update
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ContextTypes
-from config import ADMIN_IDS, STAFF as STAFF_CONFIG
+from config import ADMIN_IDS, STAFF as STAFF_CONFIG, OFFICE_LAT, OFFICE_LNG, OFFICE_RADIUS_M
 import sheets
 
 logger = logging.getLogger(__name__)
 
 # In-memory session cache: { telegram_id: {"name": str, "checkin": str, "row": int, "date": str} }
 active_sessions: dict[int, dict] = {}
+
+# Pending location requests: { telegram_id: {"action": "checkin"|"checkout", "time_str": str} }
+pending_location: dict[int, dict] = {}
+
+
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Return distance in metres between two lat/lng points."""
+    R = 6_371_000  # Earth radius in metres
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _location_keyboard() -> ReplyKeyboardMarkup:
+    btn = KeyboardButton("📍 Chia sẻ vị trí", request_location=True)
+    return ReplyKeyboardMarkup([[btn]], one_time_keyboard=True, resize_keyboard=True)
 
 
 
@@ -100,26 +119,14 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
     else:
         time_str = _now_time()
-    try:
-        row_index = sheets.checkin_to_sheet(user_id, name, date_str, time_str)
-    except Exception as e:
-        logger.error("Sheet write error on check-in: %s", e)
-        await update.message.reply_text("❌ Không thể ghi nhận giờ vào. Vui lòng thử lại.")
-        return
 
-    active_sessions[user_id] = {
-        "name": name,
-        "checkin": time_str,
-        "row": row_index,
-        "date": date_str,
-    }
-
+    # Store pending action and ask for location
+    pending_location[user_id] = {"action": "checkin", "time_str": time_str, "name": name, "date": date_str}
     await update.message.reply_text(
-        f"✅ *Chấm công vào thành công!*\n"
-        f"👤 Họ tên: {name}\n"
-        f"📅 Ngày: {date_str}\n"
-        f"🕐 Giờ vào: {time_str}",
+        f"📍 *{name}*, vui lòng chia sẻ vị trí của bạn để xác nhận chấm công vào.\n"
+        f"_(Chỉ chấp nhận trong vòng {OFFICE_RADIUS_M}m từ văn phòng)_",
         parse_mode="Markdown",
+        reply_markup=_location_keyboard(),
     )
 
 
@@ -161,12 +168,9 @@ async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         time_str = _now_time()
 
-    # Resolve row from cache or fall back to sheet scan (after bot restart)
+    # Verify check-in exists before asking for location
     session = active_sessions.get(user_id)
-    if session and session["date"] == date_str:
-        row_index = session["row"]
-        checkin_time = session["checkin"]
-    else:
+    if not (session and session["date"] == date_str):
         row_index = sheets.find_open_checkin(user_id, date_str)
         if row_index is None:
             await update.message.reply_text(
@@ -174,30 +178,107 @@ async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode="Markdown",
             )
             return
-        # Rebuild checkin time from sheet
-        sheet = sheets.get_sheet()
-        checkin_time = sheet.cell(row_index, 4).value or "00:00:00"
 
-    duration = sheets._calc_duration(checkin_time, time_str)
+    # Store pending action and ask for location
+    pending_location[user_id] = {"action": "checkout", "time_str": time_str, "name": name, "date": date_str}
+    await update.message.reply_text(
+        f"📍 *{name}*, vui lòng chia sẻ vị trí của bạn để xác nhận chấm công ra.\n"
+        f"_(Chỉ chấp nhận trong vòng {OFFICE_RADIUS_M}m từ văn phòng)_",
+        parse_mode="Markdown",
+        reply_markup=_location_keyboard(),
+    )
 
-    try:
-        sheets.checkout_to_sheet(row_index, time_str, duration)
-    except Exception as e:
-        logger.error("Sheet write error on check-out: %s", e)
-        await update.message.reply_text("❌ Không thể ghi nhận giờ ra. Vui lòng thử lại.")
+
+# ── Location handler ──────────────────────────────────────────────────────────
+
+async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    staff = _get_staff()
+    if user_id not in staff:
+        await update.message.reply_text("❌ Bạn chưa được đăng ký.", reply_markup=ReplyKeyboardRemove())
         return
 
-    # Clear session
-    active_sessions.pop(user_id, None)
+    pending = pending_location.pop(user_id, None)
+    if pending is None:
+        await update.message.reply_text("ℹ️ Không có yêu cầu chấm công đang chờ.", reply_markup=ReplyKeyboardRemove())
+        return
 
-    await update.message.reply_text(
-        f"✅ *Chấm công ra thành công!*\n"
-        f"👤 Họ tên: {name}\n"
-        f"📅 Ngày: {date_str}\n"
-        f"🕐 Giờ ra: {time_str}\n"
-        f"⏱️ Thời gian làm việc: {duration}",
-        parse_mode="Markdown",
-    )
+    loc = update.message.location
+    distance = _haversine_m(loc.latitude, loc.longitude, OFFICE_LAT, OFFICE_LNG)
+
+    if distance > OFFICE_RADIUS_M:
+        await update.message.reply_text(
+            f"❌ Vị trí của bạn cách văn phòng *{distance:.0f}m* (giới hạn {OFFICE_RADIUS_M}m).\n"
+            "Chấm công không được chấp nhận.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    name = pending["name"]
+    date_str = pending["date"]
+    time_str = pending["time_str"]
+
+    if pending["action"] == "checkin":
+        try:
+            row_index = sheets.checkin_to_sheet(user_id, name, date_str, time_str)
+        except Exception as e:
+            logger.error("Sheet write error on check-in: %s", e)
+            await update.message.reply_text("❌ Không thể ghi nhận giờ vào. Vui lòng thử lại.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        active_sessions[user_id] = {
+            "name": name,
+            "checkin": time_str,
+            "row": row_index,
+            "date": date_str,
+        }
+        await update.message.reply_text(
+            f"✅ *Chấm công vào thành công!*\n"
+            f"👤 Họ tên: {name}\n"
+            f"📅 Ngày: {date_str}\n"
+            f"🕐 Giờ vào: {time_str}\n"
+            f"📍 Khoảng cách: {distance:.0f}m",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    else:  # checkout
+        session = active_sessions.get(user_id)
+        if session and session["date"] == date_str:
+            row_index = session["row"]
+            checkin_time = session["checkin"]
+        else:
+            row_index = sheets.find_open_checkin(user_id, date_str)
+            if row_index is None:
+                await update.message.reply_text(
+                    f"⚠️ *{name}*, bạn chưa chấm công vào hôm nay!",
+                    parse_mode="Markdown",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return
+            sheet = sheets.get_sheet()
+            checkin_time = sheet.cell(row_index, 4).value or "00:00:00"
+
+        duration = sheets._calc_duration(checkin_time, time_str)
+        try:
+            sheets.checkout_to_sheet(row_index, time_str, duration)
+        except Exception as e:
+            logger.error("Sheet write error on check-out: %s", e)
+            await update.message.reply_text("❌ Không thể ghi nhận giờ ra. Vui lòng thử lại.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        active_sessions.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ *Chấm công ra thành công!*\n"
+            f"👤 Họ tên: {name}\n"
+            f"📅 Ngày: {date_str}\n"
+            f"🕐 Giờ ra: {time_str}\n"
+            f"⏱️ Thời gian làm việc: {duration}\n"
+            f"📍 Khoảng cách: {distance:.0f}m",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 # ── /status ───────────────────────────────────────────────────────────────────

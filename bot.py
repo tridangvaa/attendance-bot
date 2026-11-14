@@ -4,12 +4,13 @@ import sys
 import time
 from telegram import BotCommand
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from config import TELEGRAM_BOT_TOKEN
 from handlers import (
     start_handler, checkin_handler, checkout_handler,
     status_handler, report_handler,
     addstaff_handler, removestaff_handler, liststaff_handler,
+    location_handler,
 )
 import sheets
 
@@ -40,6 +41,7 @@ def _run_once() -> None:
     app.add_handler(CommandHandler("addstaff",     addstaff_handler))
     app.add_handler(CommandHandler("removestaff",  removestaff_handler))
     app.add_handler(CommandHandler("liststaff",    liststaff_handler))
+    app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     app.add_error_handler(_error_handler)
 
     async def set_commands(app: Application) -> None:

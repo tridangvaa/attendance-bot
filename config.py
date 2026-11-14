@@ -27,3 +27,8 @@ STAFF: dict[int, str] = {
 }
 
 SHEET_HEADERS = ["Date", "Staff Name", "Telegram ID", "Check-in Time", "Check-out Time", "Duration"]
+
+# Office location — set OFFICE_LAT and OFFICE_LNG in .env
+OFFICE_LAT: float = float(os.getenv("OFFICE_LAT", "0.0"))
+OFFICE_LNG: float = float(os.getenv("OFFICE_LNG", "0.0"))
+OFFICE_RADIUS_M: int = 200  # metres

@@ -1,4 +1,4 @@
-python-telegram-bot>=20.0
-python-dotenv>=1.0.0
-gspread>=6.0.0
-google-auth>=2.0.0
+python-telegram-bot>=20.0,<22.0
+python-dotenv>=1.0.0,<2.0.0
+gspread>=6.0.0,<7.0.0
+google-auth>=2.0.0,<3.0.0

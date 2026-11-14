@@ -1,5 +1,6 @@
 .env
 credentials.json
 *.bak
+*.log
 __pycache__/
 *.pyc
