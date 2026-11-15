@@ -1,9 +1,8 @@
 import logging
-import math
 from datetime import datetime, timezone, timedelta
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update
 from telegram.ext import ContextTypes
-from config import ADMIN_IDS, STAFF as STAFF_CONFIG, OFFICE_LAT, OFFICE_LNG, OFFICE_RADIUS_M
+from config import ADMIN_IDS
 import sheets
 
 logger = logging.getLogger(__name__)
@@ -11,31 +10,10 @@ logger = logging.getLogger(__name__)
 # In-memory session cache: { telegram_id: {"name": str, "checkin": str, "row": int, "date": str} }
 active_sessions: dict[int, dict] = {}
 
-# Pending location requests: { telegram_id: {"action": "checkin"|"checkout", "time_str": str} }
-pending_location: dict[int, dict] = {}
-
-
-def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Return distance in metres between two lat/lng points."""
-    R = 6_371_000  # Earth radius in metres
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lng2 - lng1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def _location_keyboard() -> ReplyKeyboardMarkup:
-    btn = KeyboardButton("📍 Chia sẻ vị trí", request_location=True)
-    return ReplyKeyboardMarkup([[btn]], one_time_keyboard=True, resize_keyboard=True)
-
-
 
 def _get_staff() -> dict[int, str]:
-    """Merge config.py staff with Google Sheet staff. Sheet entries take priority."""
-    merged = dict(STAFF_CONFIG)
-    merged.update(sheets.load_staff())
-    return merged
+    """Always fetch the latest staff list from the sheet."""
+    return sheets.load_staff()
 
 
 _VN_TZ = timezone(timedelta(hours=7))
@@ -55,18 +33,18 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
-        await update.message.reply_text("❌ Bạn chưa được đăng ký. Vui lòng liên hệ quản trị viên.")
+        await update.message.reply_text("❌ You are not registered. Contact your admin.")
         return
 
     name = staff[user_id]
     await update.message.reply_text(
-        f"👋 Xin chào, *{name}*!\n\n"
-        "Các lệnh có thể sử dụng:\n"
-        "  /checkin _[HH:MM]_  — Ghi nhận giờ vào\n"
-        "  /checkout _[HH:MM]_ — Ghi nhận giờ ra\n"
-        "  /status              — Xem trạng thái hôm nay\n"
-        "  /report              — Báo cáo tổng hợp _(chỉ admin)_\n\n"
-        "_Thời gian không bắt buộc. Nếu bỏ qua, hệ thống dùng giờ hiện tại._",
+        f"👋 Hello, *{name}*!\n\n"
+        "Available commands:\n"
+        "  /checkin _[HH:MM]_  — Record your arrival\n"
+        "  /checkout _[HH:MM]_ — Record your departure\n"
+        "  /status              — View your status today\n"
+        "  /report              — Today's full report _(admin only)_\n\n"
+        "_Time is optional. If omitted, current time is used._",
         parse_mode="Markdown",
     )
 
@@ -74,32 +52,20 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── /checkin ──────────────────────────────────────────────────────────────────
 
 async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not sheets.claim_update(update.update_id):
-        return
-
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
-        await update.message.reply_text("❌ Bạn chưa được đăng ký.")
+        await update.message.reply_text("❌ You are not registered.")
         return
 
     name = staff[user_id]
     date_str = _today()
 
-    # Block duplicate check-in — check memory first, then sheet (works across multiple instances)
+    # Block duplicate check-in
     session = active_sessions.get(user_id)
     if session and session["date"] == date_str:
         await update.message.reply_text(
-            f"⚠️ *{name}*, bạn đã chấm công vào lúc *{session['checkin']}* hôm nay rồi.",
-            parse_mode="Markdown",
-        )
-        return
-    existing_row = sheets.find_open_checkin(user_id, date_str)
-    if existing_row is not None:
-        sheet = sheets.get_sheet()
-        existing_time = sheet.cell(existing_row, 4).value or "?"
-        await update.message.reply_text(
-            f"⚠️ *{name}*, bạn đã chấm công vào lúc *{existing_time}* hôm nay rồi.",
+            f"⚠️ *{name}*, you already checked in at *{session['checkin']}* today.",
             parse_mode="Markdown",
         )
         return
@@ -115,42 +81,44 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 datetime.strptime(raw, "%H:%M:%S")
                 time_str = raw
         except ValueError:
-            await update.message.reply_text("❌ Định dạng giờ không hợp lệ. Dùng `/checkin HH:MM` hoặc `/checkin HH:MM:SS`.", parse_mode="Markdown")
+            await update.message.reply_text("❌ Invalid time format. Use `/checkin HH:MM` or `/checkin HH:MM:SS`.", parse_mode="Markdown")
             return
     else:
         time_str = _now_time()
+    try:
+        row_index = sheets.checkin_to_sheet(user_id, name, date_str, time_str)
+    except Exception as e:
+        logger.error("Sheet write error on check-in: %s", e)
+        await update.message.reply_text("❌ Failed to record check-in. Try again.")
+        return
 
-    # Store pending action and ask for location
-    pending_location[user_id] = {"action": "checkin", "time_str": time_str, "name": name, "date": date_str}
+    active_sessions[user_id] = {
+        "name": name,
+        "checkin": time_str,
+        "row": row_index,
+        "date": date_str,
+    }
+
     await update.message.reply_text(
-        f"📍 *{name}*, vui lòng chia sẻ vị trí của bạn để xác nhận chấm công vào.\n"
-        f"_(Chỉ chấp nhận trong vòng {OFFICE_RADIUS_M}m từ văn phòng)_",
+        f"✅ *Check-in recorded!*\n"
+        f"👤 Name: {name}\n"
+        f"📅 Date: {date_str}\n"
+        f"🕐 Time: {time_str}",
         parse_mode="Markdown",
-        reply_markup=_location_keyboard(),
     )
 
 
 # ── /checkout ─────────────────────────────────────────────────────────────────
 
 async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not sheets.claim_update(update.update_id):
-        return
-
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
-        await update.message.reply_text("❌ Bạn chưa được đăng ký.")
+        await update.message.reply_text("❌ You are not registered.")
         return
 
     name = staff[user_id]
     date_str = _today()
-
-    if sheets.find_completed_checkout(user_id, date_str):
-        await update.message.reply_text(
-            f"⚠️ *{name}*, bạn đã chấm công ra hôm nay rồi.",
-            parse_mode="Markdown",
-        )
-        return
 
     # Accept optional time argument: /checkout 17:30 or /checkout 17:30:00
     if context.args:
@@ -163,122 +131,48 @@ async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 datetime.strptime(raw, "%H:%M:%S")
                 time_str = raw
         except ValueError:
-            await update.message.reply_text("❌ Định dạng giờ không hợp lệ. Dùng `/checkout HH:MM` hoặc `/checkout HH:MM:SS`.", parse_mode="Markdown")
+            await update.message.reply_text("❌ Invalid time format. Use `/checkout HH:MM` or `/checkout HH:MM:SS`.", parse_mode="Markdown")
             return
     else:
         time_str = _now_time()
 
-    # Verify check-in exists before asking for location
+    # Resolve row from cache or fall back to sheet scan (after bot restart)
     session = active_sessions.get(user_id)
-    if not (session and session["date"] == date_str):
+    if session and session["date"] == date_str:
+        row_index = session["row"]
+        checkin_time = session["checkin"]
+    else:
         row_index = sheets.find_open_checkin(user_id, date_str)
         if row_index is None:
             await update.message.reply_text(
-                f"⚠️ *{name}*, bạn chưa chấm công vào hôm nay!",
+                f"⚠️ *{name}*, you haven't checked in today yet!",
                 parse_mode="Markdown",
             )
             return
+        # Rebuild checkin time from sheet
+        sheet = sheets.get_sheet()
+        checkin_time = sheet.cell(row_index, 4).value or "00:00:00"
 
-    # Store pending action and ask for location
-    pending_location[user_id] = {"action": "checkout", "time_str": time_str, "name": name, "date": date_str}
+    duration = sheets._calc_duration(checkin_time, time_str)
+
+    try:
+        sheets.checkout_to_sheet(row_index, time_str, duration)
+    except Exception as e:
+        logger.error("Sheet write error on check-out: %s", e)
+        await update.message.reply_text("❌ Failed to record check-out. Try again.")
+        return
+
+    # Clear session
+    active_sessions.pop(user_id, None)
+
     await update.message.reply_text(
-        f"📍 *{name}*, vui lòng chia sẻ vị trí của bạn để xác nhận chấm công ra.\n"
-        f"_(Chỉ chấp nhận trong vòng {OFFICE_RADIUS_M}m từ văn phòng)_",
+        f"✅ *Check-out recorded!*\n"
+        f"👤 Name: {name}\n"
+        f"📅 Date: {date_str}\n"
+        f"🕐 Time: {time_str}\n"
+        f"⏱️ Duration: {duration}",
         parse_mode="Markdown",
-        reply_markup=_location_keyboard(),
     )
-
-
-# ── Location handler ──────────────────────────────────────────────────────────
-
-async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    staff = _get_staff()
-    if user_id not in staff:
-        await update.message.reply_text("❌ Bạn chưa được đăng ký.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    pending = pending_location.pop(user_id, None)
-    if pending is None:
-        await update.message.reply_text("ℹ️ Không có yêu cầu chấm công đang chờ.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    loc = update.message.location
-    distance = _haversine_m(loc.latitude, loc.longitude, OFFICE_LAT, OFFICE_LNG)
-
-    if distance > OFFICE_RADIUS_M:
-        await update.message.reply_text(
-            f"❌ Vị trí của bạn cách văn phòng *{distance:.0f}m* (giới hạn {OFFICE_RADIUS_M}m).\n"
-            "Chấm công không được chấp nhận.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-
-    name = pending["name"]
-    date_str = pending["date"]
-    time_str = pending["time_str"]
-
-    if pending["action"] == "checkin":
-        try:
-            row_index = sheets.checkin_to_sheet(user_id, name, date_str, time_str)
-        except Exception as e:
-            logger.error("Sheet write error on check-in: %s", e)
-            await update.message.reply_text("❌ Không thể ghi nhận giờ vào. Vui lòng thử lại.", reply_markup=ReplyKeyboardRemove())
-            return
-
-        active_sessions[user_id] = {
-            "name": name,
-            "checkin": time_str,
-            "row": row_index,
-            "date": date_str,
-        }
-        await update.message.reply_text(
-            f"✅ *Chấm công vào thành công!*\n"
-            f"👤 Họ tên: {name}\n"
-            f"📅 Ngày: {date_str}\n"
-            f"🕐 Giờ vào: {time_str}\n"
-            f"📍 Khoảng cách: {distance:.0f}m",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-
-    else:  # checkout
-        session = active_sessions.get(user_id)
-        if session and session["date"] == date_str:
-            row_index = session["row"]
-            checkin_time = session["checkin"]
-        else:
-            row_index = sheets.find_open_checkin(user_id, date_str)
-            if row_index is None:
-                await update.message.reply_text(
-                    f"⚠️ *{name}*, bạn chưa chấm công vào hôm nay!",
-                    parse_mode="Markdown",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                return
-            sheet = sheets.get_sheet()
-            checkin_time = sheet.cell(row_index, 4).value or "00:00:00"
-
-        duration = sheets._calc_duration(checkin_time, time_str)
-        try:
-            sheets.checkout_to_sheet(row_index, time_str, duration)
-        except Exception as e:
-            logger.error("Sheet write error on check-out: %s", e)
-            await update.message.reply_text("❌ Không thể ghi nhận giờ ra. Vui lòng thử lại.", reply_markup=ReplyKeyboardRemove())
-            return
-
-        active_sessions.pop(user_id, None)
-        await update.message.reply_text(
-            f"✅ *Chấm công ra thành công!*\n"
-            f"👤 Họ tên: {name}\n"
-            f"📅 Ngày: {date_str}\n"
-            f"🕐 Giờ ra: {time_str}\n"
-            f"⏱️ Thời gian làm việc: {duration}\n"
-            f"📍 Khoảng cách: {distance:.0f}m",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
@@ -287,7 +181,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     staff = _get_staff()
     if user_id not in staff:
-        await update.message.reply_text("❌ Bạn chưa được đăng ký.")
+        await update.message.reply_text("❌ You are not registered.")
         return
 
     name = staff[user_id]
@@ -295,12 +189,16 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session = active_sessions.get(user_id)
 
     if session and session["date"] == date_str:
-        # Currently checked in, not yet checked out
+        # Currently checked in
+        now = datetime.strptime(_now_time(), "%H:%M:%S")  # already VN time via _now_time()
+        start = datetime.strptime(session["checkin"], "%H:%M:%S")
+        elapsed_min = int((now - start).total_seconds() // 60)
+        hours, minutes = divmod(elapsed_min, 60)
         await update.message.reply_text(
-            f"📊 *Trạng thái — {name}*\n"
-            f"📅 Ngày: {date_str}\n"
-            f"✅ Giờ vào: {session['checkin']}\n"
-            f"⏳ Chưa checkout",
+            f"📊 *Status — {name}*\n"
+            f"📅 Date: {date_str}\n"
+            f"✅ Checked in at: {session['checkin']}\n"
+            f"⏳ Time so far: {hours}h {minutes:02d}m",
             parse_mode="Markdown",
         )
     else:
@@ -313,16 +211,16 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if user_record and user_record.get("Check-in Time"):
             await update.message.reply_text(
-                f"📊 *Trạng thái — {name}*\n"
-                f"📅 Ngày: {date_str}\n"
-                f"✅ Giờ vào: {user_record['Check-in Time']}\n"
-                f"✅ Giờ ra: {user_record.get('Check-out Time') or '—'}\n"
-                f"⏱️ Thời gian làm việc: {user_record.get('Duration') or '—'}",
+                f"📊 *Status — {name}*\n"
+                f"📅 Date: {date_str}\n"
+                f"✅ Check-in: {user_record['Check-in Time']}\n"
+                f"✅ Check-out: {user_record.get('Check-out Time') or '—'}\n"
+                f"⏱️ Duration: {user_record.get('Duration') or '—'}",
                 parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(
-                f"📊 *{name}* — Chưa có dữ liệu chấm công hôm nay ({date_str}).",
+                f"📊 *{name}* — No attendance record for today ({date_str}).",
                 parse_mode="Markdown",
             )
 
@@ -332,7 +230,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Lệnh này chỉ dành cho quản trị viên.")
+        await update.message.reply_text("❌ This command is for admins only.")
         return
 
     # Optional: /report 2024-06-01 — default to today
@@ -343,22 +241,22 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         records = sheets.get_report(date_str)
     except Exception as e:
         logger.error("Sheet read error on report: %s", e)
-        await update.message.reply_text("❌ Không thể lấy báo cáo.")
+        await update.message.reply_text("❌ Failed to fetch report.")
         return
 
     if not records:
-        await update.message.reply_text(f"📊 Không có dữ liệu chấm công cho ngày *{date_str}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"📊 No attendance records for *{date_str}*.", parse_mode="Markdown")
         return
 
-    lines = [f"📊 *Báo cáo chấm công — {date_str}*", ""]
+    lines = [f"📊 *Attendance Report — {date_str}*", ""]
     for r in records:
         checkin = r.get("Check-in Time") or "—"
-        checkout = r.get("Check-out Time") or "⏳ Chưa ra"
+        checkout = r.get("Check-out Time") or "⏳ In"
         duration = r.get("Duration") or "—"
         lines.append(f"👤 *{r.get('Staff Name')}*")
-        lines.append(f"   Vào: {checkin}  |  Ra: {checkout}  |  {duration}")
+        lines.append(f"   In: {checkin}  |  Out: {checkout}  |  {duration}")
 
-    lines.append(f"\nTổng có mặt: {len(records)}/{len(_get_staff())}")
+    lines.append(f"\nTotal present: {len(records)}/{len(_get_staff())}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -367,12 +265,12 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def addstaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Lệnh này chỉ dành cho quản trị viên.")
+        await update.message.reply_text("❌ This command is for admins only.")
         return
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Cách dùng: `/addstaff <telegram_id> <họ tên>`\nVí dụ: `/addstaff 123456789 Nguyen Van A`",
+            "Usage: `/addstaff <telegram_id> <full name>`\nExample: `/addstaff 123456789 Nguyen Van A`",
             parse_mode="Markdown",
         )
         return
@@ -380,12 +278,12 @@ async def addstaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         new_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Telegram ID phải là số.")
+        await update.message.reply_text("❌ Telegram ID must be a number.")
         return
 
     name = " ".join(context.args[1:])
     sheets.add_staff(new_id, name)
-    await update.message.reply_text(f"✅ Đã thêm nhân viên: *{name}* (`{new_id}`)", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Added staff: *{name}* (`{new_id}`)", parse_mode="Markdown")
 
 
 # ── /removestaff (admin only) ─────────────────────────────────────────────────
@@ -393,12 +291,12 @@ async def addstaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def removestaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Lệnh này chỉ dành cho quản trị viên.")
+        await update.message.reply_text("❌ This command is for admins only.")
         return
 
     if not context.args:
         await update.message.reply_text(
-            "Cách dùng: `/removestaff <telegram_id>`",
+            "Usage: `/removestaff <telegram_id>`",
             parse_mode="Markdown",
         )
         return
@@ -406,14 +304,14 @@ async def removestaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Telegram ID phải là số.")
+        await update.message.reply_text("❌ Telegram ID must be a number.")
         return
 
     removed = sheets.remove_staff(target_id)
     if removed:
-        await update.message.reply_text(f"✅ Đã xóa nhân viên có ID `{target_id}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Removed staff with ID `{target_id}`.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"⚠️ Không tìm thấy nhân viên có ID `{target_id}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"⚠️ No staff found with ID `{target_id}`.", parse_mode="Markdown")
 
 
 # ── /liststaff (admin only) ───────────────────────────────────────────────────
@@ -421,15 +319,15 @@ async def removestaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def liststaff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Lệnh này chỉ dành cho quản trị viên.")
+        await update.message.reply_text("❌ This command is for admins only.")
         return
 
     staff = _get_staff()
     if not staff:
-        await update.message.reply_text("Chưa có nhân viên nào được đăng ký.")
+        await update.message.reply_text("No staff registered yet.")
         return
 
-    lines = ["👥 *Danh sách nhân viên*", ""]
+    lines = ["👥 *Staff List*", ""]
     for tid, name in staff.items():
         lines.append(f"• {name} — `{tid}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")

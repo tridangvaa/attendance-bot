@@ -15,20 +15,4 @@ GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json
 _admin_raw = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _admin_raw.split(",") if x.strip()}
 
-# ── Manual Staff List ─────────────────────────────────────────────────────────
-# Add staff here as a fallback. Staff added via /addstaff (Google Sheet) will
-# be merged on top — sheet entries take priority over entries here.
-STAFF: dict[int, str] = {
-    1989406520: "Vu Thi Thom",
-    8654360346: "Lam Tinh Nhi",
-    6441061958: "Nguyen Trung Hieu",
-    8636974699: "Tran Hoai Truc Linh",
-    1496096197: "Ho Tri Dang",
-}
-
 SHEET_HEADERS = ["Date", "Staff Name", "Telegram ID", "Check-in Time", "Check-out Time", "Duration"]
-
-# Office location — set OFFICE_LAT and OFFICE_LNG in .env
-OFFICE_LAT: float = float(os.getenv("OFFICE_LAT", "0.0"))
-OFFICE_LNG: float = float(os.getenv("OFFICE_LNG", "0.0"))
-OFFICE_RADIUS_M: int = 200  # metres
